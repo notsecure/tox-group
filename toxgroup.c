@@ -1,24 +1,8 @@
-/* todo: handle REJECT packet, scalability */
-
-#define TARGET_CONN 4
+#define TARGET_CONN 5 //number of connections wanted
 #define MAX_CONN 8 //cant be above 8 -> see code to increase
 #define CONN_ID(g, c) (c - g->connlist)
 
-#define SIZE_IP_PORT 6
-
-static void* write_ip_port(uint8_t *dest, uint32_t ip, uint16_t port)
-{
-    memcpy(dest, &ip, 4);
-    memcpy(dest + 4, &port, 2);
-    return dest + 6;
-}
-
-static void* read_ip_port(uint8_t *src, uint32_t *ip, uint16_t *port)
-{
-    memcpy(ip, src, 4);
-    memcpy(port, src + 4, 2);
-    return src + 6;
-}
+#define SIZE_PEER_INFO 8
 
 typedef struct PACKET PACKET;
 
@@ -35,31 +19,64 @@ struct PACKET {
 
 typedef struct {
     uint32_t ip;
-    uint16_t port, timeout;
-    uint8_t connect, peer_request;
-    uint8_t padding[6];
+    uint16_t port;
+    uint8_t timeout, info;
+} AUDIO;
+
+typedef struct {
+    uint32_t ip;
+    uint16_t port;
+    uint8_t timeout, info;
+
+    uint8_t connect, peer_request, nsend_audio;
+    uint8_t padding[5];
+
+    struct {
+        uint32_t ip;
+        uint16_t port;
+    } send_audio[4];
 } CONN;
 
 typedef struct {
     uint32_t ip;
-    uint16_t port, timeout;
-    uint16_t conn_id, attempted;
+    uint16_t port;
+    uint8_t timeout, info;
+
+    uint8_t conn_id, attempted, failed;
     _Bool pinged;
-    uint8_t padding[3];
+    uint8_t padding[4];
 } PEER;
 
 enum {
+    INFO_HAVEAUDIO = 1,
+    INFO_WANTCONN = 2,
+    INFO_MAXCONN = 4,
+};
+
+enum {
+    /* protocol */
     PACKET_ACCEPT,
     PACKET_REJECT,
     PACKET_CONNECT,
+    PACKET_KILL,
+
     PACKET_PEER_REQ,
     PACKET_PEERS,
 
     PACKET_ALIVE,
     PACKET_ALIVE_REQ,
 
-    PACKET_CHAT,
     PACKET_CONFIRM,
+
+    PACKET_REQUEST_AUDIO,
+    PACKET_STOP_AUDIO,
+
+    /* reliable */
+    PACKET_CHAT,
+
+    /* unreliable */
+    PACKET_AUDIO,
+    PACKET_AUDIO_INDIRECT,
 };
 
 typedef struct ToxGroup ToxGroup;
@@ -77,8 +94,12 @@ struct ToxGroup {
     uint64_t now, then;
 
     /* */
+    uint8_t info, audio_sequence, timer;
+
+    /* */
     PEER *peerlist;
-    int npeer, nconn;
+    AUDIO *audiolist;
+    int npeer, nconn, naudio;
 
     /* recent packets */
     PACKET *packet;
@@ -89,7 +110,7 @@ struct ToxGroup {
 
 static void packet_sendall(ToxGroup *g, PACKET *pk);
 static void conn_send(ToxGroup *g, CONN *c, const uint8_t *data, uint16_t length);
-static PEER* peer_add(ToxGroup *g, uint32_t ip, uint16_t port);
+static PEER* peer_add(ToxGroup *g, uint32_t ip, uint16_t port, uint8_t timeout, uint8_t info);
 
 static void _send(ToxGroup *g, uint32_t ip, uint16_t port, const uint8_t *data, uint16_t length)
 {
@@ -106,6 +127,95 @@ static void _send(ToxGroup *g, uint32_t ip, uint16_t port, const uint8_t *data, 
     if(sendto(g->sock, data, length, 0, (struct sockaddr*)&addr, sizeof(addr)) != length) {
         debug("sendto failed\n");
     }
+}
+
+static AUDIO* audio_find(ToxGroup *g, uint32_t ip, uint16_t port)
+{
+    int i;
+    AUDIO *a;
+
+    if(!g->naudio) {
+        return NULL;
+    }
+
+    i = 0;
+    do {
+        a = &g->audiolist[i];
+        if(a->ip == ip && a->port == port) {
+            return a;
+        }
+
+        i++;
+    } while(i != g->naudio);
+
+    return NULL;
+}
+
+static AUDIO* audio_add(ToxGroup *g, uint32_t ip, uint16_t port, _Bool indirect)
+{
+    AUDIO *a;
+    if(!(a = audio_find(g, ip, port))) {
+        a = realloc(g->audiolist, (g->naudio + 1) * sizeof(AUDIO));
+        if(!a) {
+            return NULL;
+        }
+        g->audiolist = a;
+        a += g->naudio++;
+
+        a->ip = ip;
+        a->port = port;
+        a->timeout = 0;
+        a->info = indirect;
+        return a;
+    }
+
+    a->timeout = 0;
+    a->info = indirect;
+    return a;
+}
+
+static void audio_recv(ToxGroup *g, CONN *c, const uint8_t *data, uint16_t len, _Bool indirect)
+{
+    CONN *cc;
+    int i, j;
+    uint32_t ip;
+    uint16_t port;
+
+    /* todo: dont do this, avoid copying memory around */
+    uint8_t packet[len + 7];
+    if(indirect) {
+        memcpy(&ip, data + 1, 4);
+        memcpy(&port, data + 5, 2);
+        audio_add(g, ip, port, 1);
+        memcpy(packet, data, len);
+    } else {
+        audio_add(g, c->ip, c->port, 0);
+        packet[0] = PACKET_AUDIO_INDIRECT;
+        memcpy(packet + 1, &c->ip, 6);
+        memcpy(packet + 7, data + 1, len - 1);
+        len += 6;
+    }
+
+    debug("recv audio %u\n", packet[7]);
+
+    i = 0;
+    do {
+        cc = &g->connlist[i];
+        if(!cc->ip) {
+            continue;
+        }
+
+        if(cc == c) {
+            continue;
+        }
+
+        j = 0;
+        do {
+            if(cc->send_audio[j].ip == c->ip && cc->send_audio[j].port == c->port) {
+                _send(g, cc->ip, cc->port, packet, len);
+            }
+        } while(++j != 4);
+    } while(++i != MAX_CONN);
 }
 
 static PACKET* packet_find(ToxGroup *g, uint32_t id)
@@ -271,12 +381,13 @@ static void conn_sendpeers(ToxGroup *g, CONN *c, uint8_t *data)
 
     d = data;
     *d++ = PACKET_ACCEPT;
+    *d++ = g->info;
     i = 0;
     do {
         p = &g->peerlist[i];
         /* exlude the peer we are sending to */
         if(p->ip != c->ip || p->port != c->port) {
-            d = write_ip_port(d, p->ip, p->port);
+            memcpy(d, p, SIZE_PEER_INFO); d += SIZE_PEER_INFO;
         }
         i++;
     } while(i != g->npeer);
@@ -291,6 +402,7 @@ static void conn_sendalive(ToxGroup *g, CONN *c, uint8_t *data)
 
     d = data;
     *d++ = PACKET_ALIVE;
+    *d++ = g->info;
     i = 0;
     do {
         cc = &g->connlist[i];
@@ -300,14 +412,28 @@ static void conn_sendalive(ToxGroup *g, CONN *c, uint8_t *data)
 
         /* exlude the peer we are sending to */
         if(cc->ip != c->ip || cc->port != c->port) {
-            d = write_ip_port(d, cc->ip, cc->port);
+            memcpy(d, cc, SIZE_PEER_INFO); d += SIZE_PEER_INFO;
         }
     } while(++i != MAX_CONN);
     conn_send(g, c, data, d - data);
 }
 
+static void conn_remove(ToxGroup *g, CONN *c)
+{
+    g->nconn--;
+    c->ip = 0;
+    c->connect = 0;
+
+    g->info &= ~INFO_MAXCONN;
+    if(g->nconn < TARGET_CONN) {
+        g->info |= INFO_WANTCONN;
+    }
+}
+
 static void conn_recv(ToxGroup *g, CONN *c, uint8_t *data, int len)
 {
+    /* todo, missing some length checks on some packets */
+    PEER *p;
     uint32_t ip;
     uint16_t port;
 
@@ -317,45 +443,50 @@ static void conn_recv(ToxGroup *g, CONN *c, uint8_t *data, int len)
         return;
     }
 
-    len--;
-
     switch(data[0]) {
-    case PACKET_ACCEPT: {
+    case PACKET_KILL: {
+        debug("connection killed\n");
+        conn_remove(g, c);
+        break;
+    }
+
+    case PACKET_REJECT:
+        debug("connection rejected\n");
+        conn_remove(g, c);
+        /* fall through */
+    case PACKET_ACCEPT:
+        if(c->connect) {
+            debug("connection accepted\n");
+            c->connect = 0;
+        }
+        /* fall through */
+    case PACKET_ALIVE: {
         data++;
+        c->info = *data++;
+        len -= 2;
         do {
-            len -= SIZE_IP_PORT;
+            len -= SIZE_PEER_INFO;
             if(len < 0) {
                 break;
             }
-            data = read_ip_port(data, &ip, &port);
-            peer_add(g, ip, port);
+            memcpy(&ip, data, 4);
+            memcpy(&port, data + 4, 2);
+            p = peer_add(g, ip, port, data[6], data[7]);
+            if(p && (data[7] & INFO_HAVEAUDIO) && !conn_find(g, ip, port) && !audio_find(g, ip, port)) {
+                audio_add(g, ip, port, 1);//repeats audio_find
+                data--;
+                data[0] = PACKET_REQUEST_AUDIO;
+                conn_send(g, c, data, 7);
+            }
+            data += SIZE_PEER_INFO;
         } while(1);
 
-        if(c->connect) {
-            debug("connection accepted\n");
-        }
-
-        c->connect = 0;
+        c->peer_request = 0;
         break;
     }
 
     case PACKET_CONNECT: {
         conn_sendpeers(g, c, data);
-        break;
-    }
-
-    case PACKET_ALIVE: {
-        data++;
-        do {
-            len -= SIZE_IP_PORT;
-            if(len < 0) {
-                break;
-            }
-            data = read_ip_port(data, &ip, &port);
-            peer_add(g, ip, port);
-        } while(1);
-
-        c->peer_request = 0;
         break;
     }
 
@@ -366,14 +497,30 @@ static void conn_recv(ToxGroup *g, CONN *c, uint8_t *data, int len)
     }
 
     case PACKET_CHAT: {
-        if(packet_add(g, c, PACKET_CHAT, data, len)) {
-            g->message_callback(g, data + 6, len - 5);
+        if(packet_add(g, c, PACKET_CHAT, data, len - 1)) {
+            g->message_callback(g, data + 6, len - 6);
         }
         break;
     }
 
     case PACKET_CONFIRM: {
-        packet_confirm(g, c, data + 1, len);
+        packet_confirm(g, c, data + 1, len - 1);
+        break;
+    }
+
+    case PACKET_REQUEST_AUDIO: {
+        memcpy(&c->send_audio[c->nsend_audio], data + 1, 6);
+        c->nsend_audio = (c->nsend_audio + 1) & 3;
+        break;
+    }
+
+    case PACKET_STOP_AUDIO: {
+        break;
+    }
+
+    case PACKET_AUDIO_INDIRECT:
+    case PACKET_AUDIO: {
+        audio_recv(g, c, data, len, (data[0] != PACKET_AUDIO));
         break;
     }
     }
@@ -392,15 +539,26 @@ static CONN* conn_new(ToxGroup *g, PEER *p, _Bool request)
 
     p->conn_id = i;
     g->nconn++;
+    if(g->nconn >= TARGET_CONN) {
+        g->info &= ~INFO_WANTCONN;
+    }
+
+    if(g->nconn == MAX_CONN) {
+        g->info |= INFO_MAXCONN;
+    }
 
     c->ip = p->ip;
     c->port = p->port;
     c->timeout = 0;
+    c->info = request ? 0 : INFO_WANTCONN;
     c->connect = request;
     c->peer_request = 0;
+    c->nsend_audio = 0;
+
+    memset(&c->send_audio, 0, sizeof(c->send_audio));
 
     p->pinged = 1;
-    p->attempted = 1;
+    p->attempted++;
 
     if(!(pk = g->packet)) {
         return c;
@@ -435,7 +593,7 @@ static PEER* peer_find(ToxGroup *g, uint32_t ip, uint16_t port)
     return NULL;
 }
 
-static PEER* peer_add(ToxGroup *g, uint32_t ip, uint16_t port)
+static PEER* peer_add(ToxGroup *g, uint32_t ip, uint16_t port, uint8_t timeout, uint8_t info)
 {
     PEER *p;
     if(!(p = peer_find(g, ip, port))) {
@@ -448,14 +606,18 @@ static PEER* peer_add(ToxGroup *g, uint32_t ip, uint16_t port)
 
         p->ip = ip;
         p->port = port;
-        p->timeout = 0;
+        p->timeout = timeout;
+        p->info = info;
         p->pinged = 0;
-        p->conn_id = 0xFFFF;
+        p->conn_id = 0xFF;
         p->attempted = 0;
         return p;
     }
 
-    p->timeout = 0;
+    if(timeout < p->timeout) {
+        p->timeout = timeout;
+    }
+    p->info = info;
     return p;
 }
 
@@ -464,7 +626,7 @@ static CONN* peer_add_connection(ToxGroup *g, uint32_t ip, uint16_t port, _Bool 
     CONN *c;
     PEER *p;
 
-    p = peer_add(g, ip, port);
+    p = peer_add(g, ip, port, 0, 0);
     c = conn_new(g, p, request);
 
     return c;
@@ -477,19 +639,23 @@ static void peer_send(ToxGroup *g, PEER *p, const uint8_t *data, uint16_t length
 
 static PEER* peer_choose(ToxGroup *g)
 {
-    PEER *p;
+    PEER *p, *rp;
     int i;
+    uint8_t attempted;
 
+    rp = NULL;
+    attempted = 0xFF;
     i = 0;
     do {
         p = &g->peerlist[i];
-        if(!p->attempted) {
-            return p;
+        if(p->attempted < attempted && (p->info & INFO_WANTCONN) && !conn_find(g, p->ip, p->port)) {
+            attempted = p->attempted;
+            rp = p;
         }
         i++;
     } while(i != g->npeer);
 
-    return NULL;
+    return rp;
 }
 
 static ToxGroup* _toxgroup_new(void)
@@ -502,6 +668,7 @@ static ToxGroup* _toxgroup_new(void)
     }
 
     g->then = get_time() - msec(1000);
+    g->info = INFO_WANTCONN;
 
     if((g->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == ~0) {
         free(g);
@@ -552,7 +719,7 @@ ToxGroup* toxgroup_new_bootstrap(uint32_t ip, uint16_t port)
     return g;
 }
 
-void toxgroup_sendchat(ToxGroup *g, const uint8_t *chat, uint16_t len)
+static void _toxgroup_senddata(ToxGroup *g, uint8_t type, const uint8_t *data, uint16_t len)
 {
     PACKET *pk;
     uint32_t id;
@@ -562,9 +729,47 @@ void toxgroup_sendchat(ToxGroup *g, const uint8_t *chat, uint16_t len)
     }
 
     id = (uint32_t)get_time();
-    if((pk = packet_new(g, PACKET_CHAT, 0, id, chat, len))) {
+    if((pk = packet_new(g, type, 0, id, data, len))) {
         packet_sendall(g, pk);
     }
+}
+
+void toxgroup_sendchat(ToxGroup *g, const uint8_t *chat, uint16_t len)
+{
+    _toxgroup_senddata(g, PACKET_CHAT, chat, len);
+}
+
+static void _toxgroup_sendall(ToxGroup *g, const uint8_t *data, uint16_t len)
+{
+    CONN *c;
+    int i;
+
+    i = 0;
+    do {
+        c = &g->connlist[i];
+        if(!c->ip) {
+            continue;
+        }
+        conn_send(g, c, data, len);
+    } while(++i != MAX_CONN);
+}
+
+void toxgroup_beginaudio(ToxGroup *g)
+{
+    g->info |= INFO_HAVEAUDIO;
+}
+
+void toxgroup_sendaudio(ToxGroup *g)
+{
+    uint8_t packet[2];
+    packet[0] = PACKET_AUDIO;
+    packet[1] = g->audio_sequence++;
+    _toxgroup_sendall(g, packet, 2);
+}
+
+void toxgroup_endaudio(ToxGroup *g)
+{
+    g->info &= ~INFO_HAVEAUDIO;
 }
 
 void toxgroup_do(ToxGroup *g)
@@ -580,6 +785,7 @@ void toxgroup_do(ToxGroup *g)
     PEER *p;
     CONN *c;
     PACKET *pk;
+    AUDIO *a;
     int i;
     _Bool ping;
 
@@ -598,32 +804,34 @@ void toxgroup_do(ToxGroup *g)
         /* find address in connection list */
         if((c = conn_find(g, addr.ip, addr.port)) != NULL) {
             conn_recv(g, c, data, len);
-            peer_add(g, addr.ip, addr.port);
+            peer_add(g, addr.ip, addr.port, 0, 0);
             continue;
         }
 
-        /* invalid length packet from non-connected peer */
-        if(len != 1) {
+        if(!len) {
             continue;
         }
 
         /* join packet only valid packet */
         if(data[0] != PACKET_CONNECT) {
+            data[0] = PACKET_KILL;
+            _send(g, addr.ip, addr.port, data, 1);
             continue;
         }
 
         if(g->nconn == MAX_CONN) {
+            peer_add(g, addr.ip, addr.port, 0, 0);
+
             d = data;
             *d++ = PACKET_REJECT;
+            *d++ = g->info;
             i = 0;
             do {
-                p = &g->peerlist[i];
-                /* exlude the peer we are sending to */
-                if(p->ip != addr.ip || p->port != addr.port) {
-                    d = write_ip_port(d, p->ip, p->port);
+                c = &g->connlist[i];
+                if(c->ip != addr.ip || c->port != addr.port) {
+                    memcpy(d, c, SIZE_PEER_INFO); d += SIZE_PEER_INFO;
                 }
-                i++;
-            } while(i != g->npeer);
+            } while(++i != MAX_CONN);
             _send(g, addr.ip, addr.port, data, d - data);
             continue;
         }
@@ -642,6 +850,26 @@ void toxgroup_do(ToxGroup *g)
             break;
         }
         g->then += msec(1000);
+
+        g->timer++;
+        if(g->timer == 5) {
+            if(g->nconn > TARGET_CONN) {
+                /* find a peer who doesn't want connections and kill the connection */
+                i = 0;
+                do {
+                    c = &g->connlist[i];
+                    if(!c->ip) {
+                        continue;
+                    }
+
+                    if(!(c->info & INFO_WANTCONN)) {
+                        conn_remove(g, c);
+                        break;
+                    }
+                } while(++i != MAX_CONN);
+            }
+            g->timer = 0;
+        }
 
         g->peer_callback(g, 0, 0);
 
@@ -662,7 +890,7 @@ void toxgroup_do(ToxGroup *g)
 
         /* peerlist */
         if(!g->npeer) {
-            break;
+            continue;
         }
 
         i = 0;
@@ -670,6 +898,7 @@ void toxgroup_do(ToxGroup *g)
         do {
             p = &g->peerlist[i];
             p->timeout++;
+
             if(p->timeout == 30) {
                 debug("peer timeout\n");
                 g->npeer--;
@@ -677,6 +906,12 @@ void toxgroup_do(ToxGroup *g)
                 /* dont need to remove from connection because connection will always time out first
                  todo: deal will case where do() hasn't been called for a long time
                  */
+                continue;
+            }
+
+            if(p->timeout == 20 && g->nconn != MAX_CONN && !conn_find(g, p->ip, p->port)) {
+                /* peer is timing out, attempt to connect to check if alive (prevent splits) */
+                conn_new(g, p, 1);
                 continue;
             }
 
@@ -698,7 +933,7 @@ void toxgroup_do(ToxGroup *g)
 
         /* connections */
         if(!g->nconn) {
-            break;
+            continue;
         }
 
         i = 0;
@@ -731,5 +966,26 @@ void toxgroup_do(ToxGroup *g)
             }
             c->peer_request++;
         } while(++i != MAX_CONN);
+
+        if(!g->naudio) {
+            continue;
+        }
+
+        i = 0;
+        do {
+            a = &g->audiolist[i];
+            a->timeout++;
+
+            if(a->timeout == 5) {
+                debug("audio req timeout\n");
+                g->naudio--;
+                memmove(a, a + 1, (g->naudio - i) * sizeof(AUDIO));
+                /* dont need to remove from connection because connection will always time out first
+                 todo: deal will case where do() hasn't been called for a long time
+                 */
+                continue;
+            }
+            i++;
+        } while(i != g->naudio);
     } while(1);
 }

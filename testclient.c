@@ -1,3 +1,5 @@
+/* very basic client to test tox-group */
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -36,7 +38,7 @@ void update_info(ToxGroup *g)
     wmove(win_info, 0, 0);
     werase(win_info);
 
-    wprintw(win_info, "npeer: %u | nconn %u\n", g->npeer, g->nconn);
+    wprintw(win_info, "npeer: %u | nconn %u | info %u\n", g->npeer, g->nconn, g->info);
     int i = 0;
     while(i < 4) {
         if(i < g->npeer) {
@@ -46,10 +48,10 @@ void update_info(ToxGroup *g)
             char ip[16];
             inet_ntop(AF_INET, &p->ip, ip, 16);
             if(!c) {
-                wprintw(win_info, "%s:%u (%u)\n", ip, p->port, p->timeout);
+                wprintw(win_info, "%s:%u (%u) (%X)\n", ip, p->port, p->timeout, p->info);
             } else {
-                wprintw(win_info, "%s:%u (%u) (%u) (%u)\n",
-                        ip, p->port, p->timeout, c->timeout, c->connect);
+                wprintw(win_info, "%s:%u (%u) (%u) (%u) (%X, %X)\n",
+                        ip, p->port, p->timeout, c->timeout, c->connect, p->info, c->info);
             }
 
         } else {
@@ -76,6 +78,7 @@ void do_input(ToxGroup *g)
 
             case '\n': {
                 toxgroup_sendchat(g, (uint8_t*)inputstr, inputlen);
+                debug("Sent: %.*s\n", inputlen, inputstr);
                 //group_write_message(inputstr, inputlen);
                 inputlen = 0;
                 break;
@@ -122,7 +125,7 @@ void peer_callback(ToxGroup *g, uint8_t id, uint8_t change)
 
 void message_callback(ToxGroup *g, const uint8_t *msg, uint16_t length)
 {
-    debug("Message: %.*s\n", length, msg);
+    debug("Anon: %.*s\n", length, msg);
 }
 
 int main(int argc, char** argv)
@@ -146,12 +149,14 @@ int main(int argc, char** argv)
         g = toxgroup_new_bootstrap(ip, port);
     } else {
         g = toxgroup_new();
+        toxgroup_beginaudio(g);
     }
 
     update_info(g);
     g->peer_callback = peer_callback;
     g->message_callback = message_callback;
 
+    int z = 0;
     while(1) {
         toxgroup_do(g);
 
@@ -161,6 +166,11 @@ int main(int argc, char** argv)
             info_change = 0;
         }
         usleep(500);
+        z++;
+        if(argc == 1 && z == 2000) {
+            toxgroup_sendaudio(g);
+            z = 0;
+        }
     }
 
     return 0;

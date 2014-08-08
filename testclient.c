@@ -63,6 +63,8 @@ void update_info(ToxGroup *g)
     wrefresh(win_info);
 }
 
+_Bool send_audio;
+
 void do_input(ToxGroup *g)
 {
     static char inputstr[256] = {0};
@@ -77,6 +79,12 @@ void do_input(ToxGroup *g)
             }
 
             case '\n': {
+                if(!memcmp("special", inputstr, 7)) {
+                    toxgroup_beginaudio(g);
+                    send_audio = 1;
+                    break;
+                }
+
                 toxgroup_sendchat(g, (uint8_t*)inputstr, inputlen);
                 debug("Sent: %.*s\n", inputlen, inputstr);
                 //group_write_message(inputstr, inputlen);
@@ -149,7 +157,6 @@ int main(int argc, char** argv)
         g = toxgroup_new_bootstrap(ip, port);
     } else {
         g = toxgroup_new();
-        toxgroup_beginaudio(g);
     }
 
     update_info(g);
@@ -167,8 +174,8 @@ int main(int argc, char** argv)
         }
         usleep(500);
         z++;
-        if(argc == 1 && z == 2000) {
-            toxgroup_sendaudio(g);
+        if(z == 2000) {
+            if(send_audio) {toxgroup_sendaudio(g);}
             z = 0;
         }
     }

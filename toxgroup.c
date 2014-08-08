@@ -900,7 +900,7 @@ void toxgroup_do(ToxGroup *g)
             p->timeout++;
 
             if(p->timeout == 30) {
-                debug("peer timeout\n");
+                //debug("peer timeout\n");
                 g->npeer--;
                 memmove(p, p + 1, (g->npeer - i) * sizeof(PEER));
                 /* dont need to remove from connection because connection will always time out first
@@ -945,7 +945,7 @@ void toxgroup_do(ToxGroup *g)
 
             c->timeout++;
             if(c->timeout == 20) {
-                debug("conn timeout\n");
+                //debug("conn timeout\n");
                 c->ip = 0;
                 g->nconn--;
                 continue;
